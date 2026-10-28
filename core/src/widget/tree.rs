@@ -286,75 +286,56 @@ impl Tree {
         diff: impl Fn(&mut Tree, &mut T),
         new_state: impl Fn(&T) -> Self,
     ) {
-        if self.children.len() > new_children.len() {
-            self.children.truncate(new_children.len());
-        }
+        let mut old_children: Vec<Option<Tree>> = mem::take(&mut self.children)
+            .into_iter()
+            .map(Some)
+            .collect();
 
-        let children_len = self.children.len();
-        let (mut id_map, mut id_list): (
-            HashMap<String, &mut Tree>,
-            VecDeque<(usize, &mut Tree)>,
-        ) = self.children.iter_mut().enumerate().fold(
-            (HashMap::new(), VecDeque::with_capacity(children_len)),
-            |(mut id_map, mut id_list), (i, c)| {
-                if let Some(id) = c.id.as_ref() {
-                    if let Internal::Custom(_, ref name) = id.0 {
-                        let _ = id_map.insert(name.to_string(), c);
-                    } else {
-                        id_list.push_back((i, c));
-                    }
-                } else {
-                    id_list.push_back((i, c));
-                }
-                (id_map, id_list)
-            },
-        );
-
-        let mut new_trees: Vec<(Tree, usize)> =
-            Vec::with_capacity(new_children.len());
-        for (i, (new, new_id)) in
-            new_children.iter_mut().zip(new_ids.iter()).enumerate()
-        {
-            let child_state = if let Some(c) = new_id.as_ref().and_then(|id| {
-                if let Internal::Custom(_, ref name) = id.0 {
-                    id_map.remove(name.as_ref())
-                } else {
-                    None
-                }
-            }) {
-                c
-            } else if let Some(i) = {
-                let mut found = None;
-                for c_i in 0..id_list.len() {
-                    if id_list[c_i].0 == i {
-                        found = Some(c_i);
-                        break;
-                    }
-                    if i < c_i {
-                        break;
-                    }
-                }
-                found
-            } {
-                let c = id_list.remove(i).unwrap().1;
-                c
-            } else {
-                let mut my_new_state = new_state(new);
-                diff(&mut my_new_state, new);
-                new_trees.push((my_new_state, i));
-                continue;
-            };
-
-            diff(child_state, new);
-        }
-
-        for (new_tree, i) in new_trees {
-            if self.children.len() > i {
-                self.children[i] = new_tree;
-            } else {
-                self.children.push(new_tree);
+        // Named states are matched by name, wherever they were before
+        let mut named: HashMap<String, VecDeque<usize>> = HashMap::new();
+        for (i, c) in old_children.iter().enumerate() {
+            if let Some(Tree {
+                id: Some(Id(Internal::Custom(_, name))),
+                ..
+            }) = c
+            {
+                named.entry(name.to_string()).or_default().push_back(i);
             }
         }
+
+        // Every new child must end up at its own index, so build the list
+        // in the new order instead of patching the old one in place
+        self.children = new_children
+            .iter_mut()
+            .zip(new_ids)
+            .enumerate()
+            .map(|(i, (new, new_id))| {
+                let named_match = new_id.as_ref().and_then(|id| match &id.0 {
+                    Internal::Custom(_, name) => named
+                        .get_mut(name.as_ref())
+                        .and_then(VecDeque::pop_front),
+                    _ => None,
+                });
+
+                // Unnamed states are matched by position
+                let old_i = named_match.or_else(|| {
+                    old_children.get(i).and_then(|c| match c {
+                        Some(Tree {
+                            id: Some(Id(Internal::Custom(..))),
+                            ..
+                        })
+                        | None => None,
+                        Some(_) => Some(i),
+                    })
+                });
+
+                let mut tree = old_i
+                    .and_then(|old_i| old_children[old_i].take())
+                    .unwrap_or_else(|| new_state(new));
+                diff(&mut tree, new);
+                tree
+            })
+            .collect();
     }
 }
 
@@ -516,5 +497,144 @@ impl fmt::Debug for State {
             Self::None => write!(f, "State::None"),
             Self::Some(_) => write!(f, "State::Some"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Layout, Length, Rectangle, Size, layout, mouse, renderer};
+
+    /// Stateful leaf widget with a named id, like `cosmic::widget::Cards`.
+    struct Named(&'static str);
+
+    struct NamedState(&'static str);
+
+    impl Widget<(), (), ()> for Named {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Shrink, Length::Shrink)
+        }
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            _renderer: &(),
+            _limits: &layout::Limits,
+        ) -> layout::Node {
+            let _ = tree.state.downcast_ref::<NamedState>();
+            layout::Node::default()
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut (),
+            _theme: &(),
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+        fn tag(&self) -> Tag {
+            Tag::of::<NamedState>()
+        }
+        fn state(&self) -> State {
+            State::new(NamedState(self.0))
+        }
+        fn id(&self) -> Option<Id> {
+            Some(Id::new(self.0))
+        }
+    }
+
+    /// Stateless container, like `Column`.
+    struct List(Vec<Box<dyn Widget<(), (), ()>>>);
+
+    impl Widget<(), (), ()> for List {
+        fn size(&self) -> Size<Length> {
+            Size::new(Length::Shrink, Length::Shrink)
+        }
+        fn layout(
+            &mut self,
+            tree: &mut Tree,
+            renderer: &(),
+            limits: &layout::Limits,
+        ) -> layout::Node {
+            for (child, tree) in self.0.iter_mut().zip(&mut tree.children) {
+                let _ = child.layout(tree, renderer, limits);
+            }
+            layout::Node::default()
+        }
+        fn draw(
+            &self,
+            _tree: &Tree,
+            _renderer: &mut (),
+            _theme: &(),
+            _style: &renderer::Style,
+            _layout: Layout<'_>,
+            _cursor: mouse::Cursor,
+            _viewport: &Rectangle,
+        ) {
+        }
+        fn children(&self) -> Vec<Tree> {
+            self.0.iter().map(|c| Tree::new(c.as_ref())).collect()
+        }
+        fn diff(&mut self, tree: &mut Tree) {
+            tree.diff_children(&mut self.0);
+        }
+    }
+
+    fn list(names: &[&'static str]) -> List {
+        List(
+            names
+                .iter()
+                .map(|n| Box::new(Named(n)) as Box<dyn Widget<(), (), ()>>)
+                .collect(),
+        )
+    }
+
+    /// Builds a tree for `before`, then rebuilds it for `after` the same way
+    /// `UserInterface::build` does, and checks every child got its own state.
+    fn rebuild(before: &[&'static str], after: &[&'static str]) {
+        let mut tree = Tree::new(&list(before) as &dyn Widget<(), (), ()>);
+
+        let mut new = list(after);
+        NAMED.with(|named| *named.borrow_mut() = tree.take_all_named());
+        tree.diff(&mut new as &mut dyn Widget<(), (), ()>);
+        let _ = new.layout(&mut tree, &(), &layout::Limits::NONE);
+        NAMED.with(|named| named.borrow_mut().clear());
+
+        assert_eq!(tree.children.len(), after.len());
+        for (child, name) in tree.children.iter().zip(after) {
+            assert_eq!(child.state.downcast_ref::<NamedState>().0, *name);
+        }
+    }
+
+    #[test]
+    fn diff_children_unchanged() {
+        rebuild(&["a", "b", "c"], &["a", "b", "c"]);
+    }
+
+    #[test]
+    fn diff_children_remove_last() {
+        rebuild(&["a", "b", "c"], &["a", "b"]);
+    }
+
+    #[test]
+    fn diff_children_remove_first() {
+        rebuild(&["a", "b", "c"], &["b", "c"]);
+    }
+
+    #[test]
+    fn diff_children_remove_middle() {
+        rebuild(&["a", "b", "c", "d"], &["a", "c", "d"]);
+    }
+
+    #[test]
+    fn diff_children_insert_first() {
+        rebuild(&["a", "b"], &["c", "a", "b"]);
+    }
+
+    #[test]
+    fn diff_children_swap() {
+        rebuild(&["a", "b"], &["b", "a"]);
     }
 }
